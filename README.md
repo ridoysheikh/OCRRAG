@@ -7,7 +7,7 @@ A minimal demonstration of PDF RAG (Retrieval-Augmented Generation) with OCR cap
 - **AWS Textract OCR**: Extract text from scanned PDFs/images
 - **RAG Chat with Citations**: Query documents with file name + page number + snippet
 - **Quote Verification**: Validates quotes against source text before output
-- **Searchable Document Storage**: ChromaDB vector store for semantic search
+- **Searchable Document Storage**: PostgreSQL + pgvector for semantic search
 
 ## Project Structure
 
@@ -18,7 +18,7 @@ OCRRAG/
 │   │   └── textract_ocr.py      # AWS Textract integration
 │   ├── rag/
 │   │   ├── embeddings.py        # Document embeddings
-│   │   ├── vector_store.py      # ChromaDB storage
+│   │   ├── vector_store.py      # PostgreSQL + pgvector storage
 │   │   └── chat.py              # RAG chat with citations
 │   ├── utils/
 │   │   └── quote_verify.py      # Quote verification
@@ -33,18 +33,28 @@ OCRRAG/
 
 ## Quick Start
 
-1. **Install dependencies**:
+1. **Set up PostgreSQL with pgvector**:
+   ```bash
+   # Using Docker (recommended)
+   docker run -d --name pgvector \
+     -e POSTGRES_PASSWORD=postgres \
+     -e POSTGRES_DB=ocrrag \
+     -p 5432:5432 \
+     pgvector/pgvector:pg16
+   ```
+
+2. **Install dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
 
-2. **Configure environment**:
+3. **Configure environment**:
    ```bash
    cp .env.example .env
-   # Edit .env with your AWS and OpenAI credentials
+   # Edit .env with your AWS, OpenAI, and PostgreSQL credentials
    ```
 
-3. **Run demo**:
+4. **Run demo**:
    ```bash
    python -m src.main
    ```

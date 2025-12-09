@@ -1,11 +1,11 @@
 """
 Vector Store Module
-ChromaDB-based storage for document embeddings with metadata.
+PostgreSQL + pgvector storage for document embeddings with metadata.
 """
 
-import chromadb
-from chromadb.config import Settings
-from pathlib import Path
+import psycopg2
+from psycopg2.extras import execute_values, RealDictCursor
+from pgvector.psycopg2 import register_vector
 from typing import Optional
 from dataclasses import dataclass
 import os
@@ -32,29 +32,70 @@ class SearchResult:
 
 
 class VectorStore:
-    """ChromaDB vector store for document chunks."""
+    """PostgreSQL + pgvector store for document chunks."""
     
     def __init__(
         self,
-        persist_dir: Optional[str] = None,
-        collection_name: str = "documents"
+        connection_string: Optional[str] = None,
+        table_name: str = "document_chunks"
     ):
         """
         Initialize vector store.
         
         Args:
-            persist_dir: Directory to persist ChromaDB data.
-            collection_name: Name of the collection.
+            connection_string: PostgreSQL connection string.
+            table_name: Name of the table for storing chunks.
         """
-        persist_dir = persist_dir or os.getenv('CHROMA_PERSIST_DIR', './data/chroma')
-        Path(persist_dir).mkdir(parents=True, exist_ok=True)
-        
-        self.client = chromadb.PersistentClient(path=persist_dir)
-        self.collection = self.client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"}
+        self.connection_string = connection_string or os.getenv(
+            'DATABASE_URL',
+            'postgresql://postgres:postgres@localhost:5432/ocrrag'
         )
+        self.table_name = table_name
         self.embedding_model = EmbeddingModel()
+        
+        self._init_db()
+    
+    def _get_connection(self):
+        """Get a database connection."""
+        conn = psycopg2.connect(self.connection_string)
+        register_vector(conn)
+        return conn
+    
+    def _init_db(self):
+        """Initialize database schema."""
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                # Enable pgvector extension
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                
+                # Create table for document chunks
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {self.table_name} (
+                        id SERIAL PRIMARY KEY,
+                        chunk_id VARCHAR(512) UNIQUE NOT NULL,
+                        filename VARCHAR(255) NOT NULL,
+                        page_number INTEGER NOT NULL,
+                        chunk_index INTEGER NOT NULL,
+                        text TEXT NOT NULL,
+                        embedding vector({self.embedding_model.dimension}),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Create index for vector similarity search (use HNSW for better performance)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS {self.table_name}_embedding_idx 
+                    ON {self.table_name} 
+                    USING hnsw (embedding vector_cosine_ops)
+                """)
+                
+                # Create index for filename filtering
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS {self.table_name}_filename_idx 
+                    ON {self.table_name} (filename)
+                """)
+                
+            conn.commit()
     
     def add_document(
         self,
@@ -75,9 +116,7 @@ class VectorStore:
         Returns:
             Number of chunks added.
         """
-        all_chunks = []
-        all_metadatas = []
-        all_ids = []
+        all_data = []
         
         for page in pages:
             page_num = page["page_number"]
@@ -87,26 +126,36 @@ class VectorStore:
             
             for chunk_idx, chunk in enumerate(chunks):
                 chunk_id = f"{filename}__p{page_num}__c{chunk_idx}"
-                all_chunks.append(chunk)
-                all_metadatas.append({
-                    "filename": filename,
-                    "page_number": page_num,
-                    "chunk_index": chunk_idx,
-                    "text": chunk  # Store full text for retrieval
-                })
-                all_ids.append(chunk_id)
+                embedding = self.embedding_model.embed_single(chunk)
+                
+                all_data.append((
+                    chunk_id,
+                    filename,
+                    page_num,
+                    chunk_idx,
+                    chunk,
+                    embedding.tolist()
+                ))
         
-        if all_chunks:
-            embeddings = self.embedding_model.embed(all_chunks).tolist()
-            
-            self.collection.add(
-                ids=all_ids,
-                embeddings=embeddings,
-                metadatas=all_metadatas,
-                documents=all_chunks
-            )
+        if all_data:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    execute_values(
+                        cur,
+                        f"""
+                        INSERT INTO {self.table_name} 
+                        (chunk_id, filename, page_number, chunk_index, text, embedding)
+                        VALUES %s
+                        ON CONFLICT (chunk_id) DO UPDATE SET
+                            text = EXCLUDED.text,
+                            embedding = EXCLUDED.embedding
+                        """,
+                        all_data,
+                        template="(%s, %s, %s, %s, %s, %s::vector)"
+                    )
+                conn.commit()
         
-        return len(all_chunks)
+        return len(all_data)
     
     def search(
         self,
@@ -115,7 +164,7 @@ class VectorStore:
         filename_filter: Optional[str] = None
     ) -> list[SearchResult]:
         """
-        Search for relevant document chunks.
+        Search for relevant document chunks using cosine similarity.
         
         Args:
             query: Search query.
@@ -127,64 +176,77 @@ class VectorStore:
         """
         query_embedding = self.embedding_model.embed_single(query).tolist()
         
-        where_filter = None
-        if filename_filter:
-            where_filter = {"filename": filename_filter}
-        
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=n_results,
-            where=where_filter,
-            include=["documents", "metadatas", "distances"]
-        )
-        
-        search_results = []
-        
-        if results['documents'] and results['documents'][0]:
-            for i, doc in enumerate(results['documents'][0]):
-                metadata = results['metadatas'][0][i]
-                distance = results['distances'][0][i]
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if filename_filter:
+                    cur.execute(f"""
+                        SELECT 
+                            text,
+                            filename,
+                            page_number,
+                            chunk_index,
+                            1 - (embedding <=> %s::vector) as score
+                        FROM {self.table_name}
+                        WHERE filename = %s
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s
+                    """, (query_embedding, filename_filter, query_embedding, n_results))
+                else:
+                    cur.execute(f"""
+                        SELECT 
+                            text,
+                            filename,
+                            page_number,
+                            chunk_index,
+                            1 - (embedding <=> %s::vector) as score
+                        FROM {self.table_name}
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s
+                    """, (query_embedding, query_embedding, n_results))
                 
-                # Convert distance to similarity score (cosine)
-                score = 1 - distance
-                
-                search_results.append(SearchResult(
-                    text=doc,
-                    filename=metadata['filename'],
-                    page_number=metadata['page_number'],
-                    chunk_index=metadata['chunk_index'],
-                    score=score
-                ))
+                rows = cur.fetchall()
         
-        return search_results
+        return [
+            SearchResult(
+                text=row['text'],
+                filename=row['filename'],
+                page_number=row['page_number'],
+                chunk_index=row['chunk_index'],
+                score=float(row['score'])
+            )
+            for row in rows
+        ]
     
     def delete_document(self, filename: str) -> int:
         """Delete all chunks for a document."""
-        # Get all IDs for this document
-        results = self.collection.get(
-            where={"filename": filename},
-            include=[]
-        )
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self.table_name} WHERE filename = %s",
+                    (filename,)
+                )
+                deleted = cur.rowcount
+            conn.commit()
         
-        if results['ids']:
-            self.collection.delete(ids=results['ids'])
-            return len(results['ids'])
-        
-        return 0
+        return deleted
     
     def list_documents(self) -> list[str]:
         """List all unique document filenames."""
-        results = self.collection.get(include=["metadatas"])
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT DISTINCT filename FROM {self.table_name} ORDER BY filename")
+                rows = cur.fetchall()
         
-        filenames = set()
-        for metadata in results['metadatas']:
-            filenames.add(metadata['filename'])
-        
-        return sorted(list(filenames))
+        return [row[0] for row in rows]
     
     def get_stats(self) -> dict:
         """Get collection statistics."""
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {self.table_name}")
+                total_chunks = cur.fetchone()[0]
+        
         return {
-            "total_chunks": self.collection.count(),
+            "total_chunks": total_chunks,
             "documents": self.list_documents()
         }
