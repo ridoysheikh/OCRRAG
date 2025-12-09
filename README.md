@@ -225,6 +225,3 @@ I cannot find relevant information in the provided documents to answer this ques
 - **PyPDF2** - Fallback PDF text extraction
 - **pdf2image** - PDF to image conversion for Textract
 
-## License
-
-MIT License - See LICENSE file for details.
